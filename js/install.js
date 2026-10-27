@@ -1,0 +1,748 @@
+/* install.html — Install a new display (or several with the same sign).
+   Battery → Scan → Location (per display) → Price type → Details → Preview + Push Content → Wake → Sent.
+   Site comes from the session; it is never asked again here. State lives in state.flows.install so a
+   detour to the battery guide (battery.html) comes back to the same step. */
+(function () {
+  "use strict";
+  const { state, save, site, go, guard, esc, I, header, bindHeader, haptic, DEVICES, SERIAL_LEN } = EC;
+  if (!guard()) return;
+
+  const FLOW_V = 7; // v0.9.5 no orientation step
+  const FLOW_V_OLD = 6; // v0.7.0 adds locKind/locGuide with defaults (older saves still load) // bump when the saved shape changes; older in-progress installs restart
+
+  /* ---------- sign headers (colors sampled from the store sign files) ---------- */
+  const SPARK = '<svg class="spark" viewBox="-16 -16 32 32" aria-hidden="true"><g fill="currentColor">' +
+    [0, 60, 120, 180, 240, 300].map((r) => `<rect x="-2.1" y="-15" width="4.2" height="10" rx="2.1" transform="rotate(${r})"/>`).join("") + "</g></svg>";
+  const TYPES = [
+    { id: "edlp", label: "Everyday Low Price", was: false, mark: SPARK },
+    { id: "rollback", label: "Rollback", was: true, mark: SPARK },
+    { id: "clearance", label: "Clearance", was: true, mark: SPARK },
+    { id: "manager", label: "Manager’s Special", was: true, mark: "" },
+  ];
+  const UOM = ["ea", "lb", "ct", "oz", "fl oz", "gal", "pk"];
+  const NO_SIZE = ["ea", "lb"]; // priced per item or per pound: no unit size
+
+  /* produce PLUs: js/plu.js, generated from the IFPS export (leading 9 = organic) */
+  const PLU = Object.fromEntries((window.ECPLU || []).map(([plu, name, size, uom, img]) => [plu, { plu, name, size, uom, img }]));
+  const RETAILER = new Set(window.ECPLU_RETAILER || []);
+  const pluLookup = (code) => {
+    if (/^\d{4}$/.test(code) && PLU[code]) return PLU[code];
+    if (/^9\d{4}$/.test(code) && PLU[code.slice(1)]) { const p = PLU[code.slice(1)]; return Object.assign({}, p, { name: "Organic " + p.name }); }
+    return null;
+  };
+
+  // v0.9.5: every display hangs landscape, so there is no orientation step (f.orient stays "landscape")
+  // v0.9.2: the battery ships charged and in the display but unplugged (shipping rules), so Install starts by plugging it in
+  /* v0.9.5: Replace › "Make a new sign" hands the new display here at Sign type (f.via = "replace"): it is already scanned,
+     its battery plugged in, and it replaces the old display at the same location when the sign is pushed. */
+  const VIA_STEPS = ["type", "details", "preview", "wake", "done"];
+  const STEPS_ALL = ["battery", "scan", "location", "type", "details", "preview", "wake", "done"];
+  const via = () => f.via === "replace";
+  const steps = () => (via() ? VIA_STEPS : STEPS_ALL);
+  const COPY = {
+    battery: ["Plug in the battery", "It ships in the display but unplugged. Swipe through the steps. Already plugged in? Tap Battery is plugged in."],
+    scan: ["Scan the display", "Scan the label on the left edge of the frame."],
+    location: ["Where is this display?", "Type the location as it’s labeled in the store."],
+    type: ["Which sign is this?", ""],
+    details: ["Enter the sign details", ""],
+    preview: ["Check the sign", "This is what the display will show."],
+    wake: ["Sign pushed", ""],
+    done: ["Sign sent", ""],
+  };
+  const WAKE = ECArt.WAKE_STEPS; // the pusher (v0.9): one list for every task
+
+  /* Insert the battery: swipe through in place (same pictures as Swap Battery, no old pack to remove) */
+  const R = (o) => ECArt.rear(o);
+  const INSERT = [
+    { art: () => ECArt.rearOverview(), title: "Find the access panel", lines: ["Turn the display so you face its back.", "The access panel is the tall plate on the left side."] },
+    { art: () => R({ screw: "out", focus: "screw", motion: "unscrew" }), title: "Loosen the thumb screw", lines: ["Turn the thumb screw counter-clockwise by hand until it comes free.", "Stiff? A #2 Phillips screwdriver works too.", "Keep the screw. The panel has only one."] },
+    { art: () => R({ cover: "tilt", screw: "none", motion: "tilt" }), title: "Remove the panel", lines: ["Swing the top of the panel away from the display.", "Lift it up and out of the slot at the bottom."] },
+    { art: () => R({ cover: "set-aside", screw: "none", plug: "apart", kind: "new", focus: "plug", motion: "plugUp" }), title: "Plug in the battery", lines: ["The battery is already in, behind the side clip. It ships unplugged.", "Push its plug onto the display plug.", "Push until no metal shows at the joint."] },
+    { art: () => R({ cover: "tilt", screw: "none", motion: "hook" }), title: "Replace the panel", lines: ["Hook the bottom tab of the panel into the slot.", "Swing the panel flat against the display."] },
+    { art: () => R({ cover: "on", screw: "out", focus: "screw", motion: "screwIn" }), title: "Tighten the thumb screw", lines: ["Turn the thumb screw clockwise by hand until snug.", "Do not overtighten."] },
+  ];
+
+  const fresh = () => ({
+    v: FLOW_V, step: "battery", battSlide: 0, orient: "landscape", multi: false, devices: [], locIdx: 0, wakeIdx: 0, wakeSlide: 0,
+    type: null, desc: "", plu: "", img: "", priceC: "", size: "", uom: "", wasC: "", lastZone: "", lastAisle: "", reject: null,
+    locKind: "endcap", locGuide: true, itemCode: "", codeTyped: "",
+  });
+  let f = state.flows.install;
+  if (!f || f.v !== FLOW_V) f = fresh();
+  f = state.flows.install = Object.assign(fresh(), f);
+  if (!steps().includes(f.step)) f.step = "battery";
+
+  const s = site();
+  const $ = (id) => document.getElementById(id);
+
+  /* ---------- formatting ---------- */
+  // Location: Zone 1–2 letters (caps), Aisle and Section 1–3 digits. Shown as A15-1.
+  const normZone = (v) => String(v).toUpperCase().replace(/[^A-Z]/g, "").slice(0, 2);
+  const normNum = (v) => String(v).replace(/\D/g, "").slice(0, 3);
+  const locOk = (d) => /^[A-Z]{1,2}$/.test(d.zone) && /^\d{1,3}$/.test(d.aisle) && /^\d{1,3}$/.test(d.section);
+  const loc = (d) => (d.zone || d.aisle || d.section ? `${d.zone || "?"}${d.aisle || "?"}-${d.section || "?"}` : "No location");
+
+  // Price: the tech types digits only; decimals are assumed. 597 → $5.97
+  const normCents = (v) => String(v).replace(/\D/g, "").replace(/^0+(?=\d)/, "").slice(0, 6);
+  const centsToNum = (c) => (c ? Number(c) / 100 : null);
+  const fmtMoney = (c) => {
+    if (!c) return "";
+    const p = c.padStart(3, "0");
+    return `$${Number(p.slice(0, -2)).toLocaleString("en-US")}.${p.slice(-2)}`;
+  };
+  // sign price parts: $ · dollars · cents (or ¢ for under a dollar)
+  const priceParts = (c) => {
+    const n = centsToNum(c);
+    if (n === null) return { cur: "$", dol: "0", cents: "00" };
+    if (n < 1) return { cur: "", dol: String(Math.round(n * 100)), cents: "¢" };
+    const p = c.padStart(3, "0");
+    return { cur: "$", dol: String(Number(p.slice(0, -2))), cents: p.slice(-2) };
+  };
+
+  const typeOf = () => TYPES.find((t) => t.id === f.type);
+  const sizeNeeded = () => !NO_SIZE.includes(f.uom);
+
+  /* ---------- validity drives the Next button ---------- */
+  function valid() {
+    const d = f.devices[f.locIdx];
+    switch (f.step) {
+      case "scan": return f.devices.length > 0;
+      case "location": return !!(d && locOk(d) && conflictOk(f.locIdx));
+      case "type": return !!f.type;
+      case "details": {
+        const t = typeOf();
+        return !!(f.itemCode && f.priceC && (!t || !t.was || f.wasC)); // v0.9: the item comes from the approved list
+      }
+      case "preview": return pv.canPush(previewKey());
+      default: return true;
+    }
+  }
+  /* preview build (js/preview.js): Push Content stays locked until it's back; 30 s limit */
+  const pv = ECPreview.controller(() => { if (f.step === "preview") render(); });
+  const previewKey = () => JSON.stringify(signOpts());
+  const nextLabel = () => ({
+    battery: "Battery is plugged in",
+    location: f.locIdx < f.devices.length - 1 ? "Next display" : "Continue",
+    details: "Preview sign",
+    preview: "Push Content",
+    wake: f.wakeIdx < f.devices.length - 1 ? "Next display" : "Done",
+  }[f.step] || "Continue");
+
+  function setStep(st) { scanner.stop(); f.step = st; f.reject = null; save(); render(); $("body").scrollTop = 0; }
+
+  function next() {
+    if (!valid()) return;
+    const n = f.devices.length;
+    if (f.step === "location" && f.locIdx < n - 1) {
+      // Zone and Aisle carry forward to the next display; Section is always fresh
+      const prev = f.devices[f.locIdx], nx = f.devices[f.locIdx + 1];
+      if (!nx.zone) nx.zone = prev.zone;
+      if (!nx.aisle) nx.aisle = prev.aisle;
+      f.locIdx++; save(); render(); return;
+    }
+    if (f.step === "preview") {
+      // the push: installed displays join the site's fleet, so Update Content can find them
+      const meta = {};
+      f.devices.forEach((d) => { meta[d.serial] = { zone: d.zone, aisle: d.aisle, section: d.section, orient: f.orient, siteId: s.id }; });
+      EC.recordPush(f.devices.map((d) => d.serial), signOpts(), meta);
+      f.devices.forEach((d) => { if (d.locMode === "replace" && d.replaces) EC.removeDisplay(d.replaces); });
+      haptic(); f.wakeIdx = 0; f.wakeSlide = 0; return setStep("wake");
+    }
+    if (f.step === "wake") EC.markWoken(f.devices[f.wakeIdx].serial);
+    if (f.step === "wake" && f.wakeIdx < n - 1) { f.wakeIdx++; f.wakeSlide = 0; save(); render(); return; }
+    if (f.step === "wake") { const last = f.devices[n - 1] || {}; f.lastZone = last.zone || ""; f.lastAisle = last.aisle || ""; if (via()) delete state.flows.replace; }
+    if (f.step === "scan") f.locIdx = 0;
+    setStep(steps()[steps().indexOf(f.step) + 1]);
+  }
+  function back() {
+    if (f.step === "battery") { go("home"); return; }
+    if (via() && f.step === "type") { delete state.flows.install; save(); go("replace"); return; } // back to Replace › Push the same sign?
+    if (f.step === "location" && f.locIdx > 0) { f.locIdx--; save(); render(); return; }
+    if (f.step === "wake" && f.wakeIdx > 0) { f.wakeIdx--; f.wakeSlide = 0; save(); render(); return; }
+    if (f.step === "type") f.locIdx = Math.max(0, f.devices.length - 1);
+    setStep(steps()[steps().indexOf(f.step) - 1]);
+  }
+  function openBatteryGuide() {
+    scanner.stop();
+    state.flows.battery = { step: 0, returnTo: "install" };
+    go("battery");
+  }
+
+  /* ---------- serial intake: one formatter owns the field (principles 16–19) ---------- */
+  const norm = (v) => String(v).replace(/[^0-9]/g, "").slice(0, SERIAL_LEN);
+  const isSerialShape = (v) => new RegExp(`^[0-9]{${SERIAL_LEN}}$`).test(v);
+
+  /* Adds a serial. Multi: the list grows and a fresh blank slot appears; the camera keeps running.
+     Single: one slot; a valid read stops the camera. Repaints only the slot list so a live camera survives. */
+  function addSerial(serial) {
+    serial = norm(serial);
+    if (serial.length !== SERIAL_LEN) return false;
+    const known = DEVICES.find((d) => d.serial === serial);
+    if (known && known.siteId !== s.id) {
+      const other = EC.site(known.siteId);
+      f.reject = { serial, why: `Registered to ${other ? other.name : "another site"}.` };
+    } else if (EC.fleet().some((d) => d.serial === serial)) {
+      const inst = EC.fleet().find((d) => d.serial === serial);
+      f.reject = { serial, why: `Already installed at ${EC.locKey(inst)}. To move or swap it, use Replace / Remove.` };
+    } else if (serial.endsWith("9999")) {
+      f.reject = { serial, why: "Not registered. This display can’t take content yet." };
+    } else if (f.devices.some((d) => d.serial === serial)) {
+      f.reject = null; save(); paintSlots(); return false; // already in the list: quiet
+    } else {
+      f.reject = null;
+      const prev = f.devices[f.devices.length - 1];
+      const dev = { serial, zone: prev ? prev.zone : f.lastZone, aisle: prev ? prev.aisle : f.lastAisle, section: "" };
+      f.devices = f.multi ? f.devices.concat([dev]) : [dev];
+      haptic(40);
+      save(); paintSlots();
+      return true;
+    }
+    save(); paintSlots();
+    return false;
+  }
+
+  /* ---------- real camera scanner ----------
+     BarcodeDetector where the browser has it (Chrome/Android), ZXing from the CDN otherwise (iOS Safari).
+     Tap = start (principle 6). Single: valid code → stop, haptic, fill (11). Multi: fill and keep scanning.
+     Wrong shape → shake, keep scanning (10). Camera released on every exit (12, 13). */
+  const ZXING_URL = "lib/zxing.min.js"; // bundled (Apache-2.0) so iPhone scanning works offline
+  const scanner = {
+    state: "idle", stream: null, raf: 0, zx: null, lastShake: 0, seen: {}, torch: false,
+    async start() {
+      if (this.state === "starting" || this.state === "running") return;
+      this.paint("starting");
+      try {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("no-camera-api");
+        const video = $("scan-video");
+        if ("BarcodeDetector" in window) {
+          const det = new window.BarcodeDetector({ formats: ["code_128", "code_39", "qr_code", "data_matrix", "ean_13"] });
+          this.stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
+          if (this.state !== "starting") { this.release(); return; } // cancelled while the permission prompt was up
+          video.srcObject = this.stream;
+          await video.play();
+          this.paint("running");
+          const tick = async () => {
+            if (this.state !== "running") return;
+            try {
+              const codes = await det.detect(video);
+              for (const c of codes) if (this.handle(c.rawValue)) return;
+            } catch { /* frame not ready */ }
+            this.raf = requestAnimationFrame(tick);
+          };
+          tick();
+        } else {
+          if (!window.ZXing) await new Promise((ok, bad) => {
+            const sc = document.createElement("script"); sc.src = ZXING_URL; sc.onload = ok; sc.onerror = () => bad(new Error("zxing-load"));
+            document.head.appendChild(sc);
+          });
+          if (this.state !== "starting") return;
+          this.zx = new window.ZXing.BrowserMultiFormatReader();
+          await this.zx.decodeFromConstraints({ video: { facingMode: "environment" }, audio: false }, video, (res) => {
+            if (res && this.state === "running") this.handle(res.getText());
+          });
+          this.stream = video.srcObject;
+          if (this.state !== "starting") { this.release(); return; }
+          this.paint("running");
+        }
+        this.offerTorch();
+      } catch (e) {
+        this.release();
+        this.paint("failed", e && e.name === "NotAllowedError" ? "Camera permission was declined." : "The camera couldn’t start here.");
+      }
+    },
+    /* returns true when the scan loop should stop */
+    handle(raw) {
+      const v = String(raw || "").trim(); // a scan must be exactly 5 digits (a UPC is not cut down to 5)
+      const now = Date.now();
+      if (isSerialShape(v)) {
+        // a code in view counts once: it must leave the frame for 2.5 s before it's read again
+        if (now - (this.seen[v] || 0) < 2500) { this.seen[v] = now; return false; } // still in view (each code tracked, so two in frame don't alternate)
+        this.seen[v] = now;
+        const ok = addSerial(v);
+        if (ok) flash(); // green only for a display that was added; rejected or already-listed reads never flash
+        if (f.multi || !ok) return false; // batch keeps going; one-display keeps the camera open after a rejected read
+        this.state = "closing"; setTimeout(() => this.stop(), 450); // one display: flash, then stop
+        return true;
+      }
+      if (now - this.lastShake > 900) { // wrong code (UPC, pallet label): shake, keep going
+        this.lastShake = now;
+        const fr = document.querySelector(".scanner .cam .vf-frame");
+        if (fr) { fr.classList.remove("shake"); void fr.offsetWidth; fr.classList.add("shake"); }
+      }
+      return false;
+    },
+    offerTorch() {
+      const track = this.stream && this.stream.getVideoTracks && this.stream.getVideoTracks()[0];
+      const caps = track && track.getCapabilities ? track.getCapabilities() : {};
+      const b = $("torch");
+      if (b && caps.torch) {
+        b.hidden = false;
+        b.onclick = async () => {
+          this.torch = !this.torch;
+          try { await track.applyConstraints({ advanced: [{ torch: this.torch }] }); } catch { /* ignore */ }
+          b.setAttribute("aria-pressed", String(this.torch));
+        };
+      }
+    },
+    release() {
+      cancelAnimationFrame(this.raf);
+      try { this.zx && this.zx.reset(); } catch { /* ignore */ }
+      this.zx = null;
+      if (this.stream) this.stream.getTracks().forEach((t) => t.stop());
+      this.stream = null;
+      const v = $("scan-video");
+      if (v) v.srcObject = null;
+      this.torch = false;
+    },
+    stop() { if (this.state === "idle") return; this.release(); this.paint("idle"); },
+    paint(st, msg) {
+      this.state = st;
+      const el = $("scanner");
+      if (!el) return;
+      el.dataset.state = st;
+      $("cam-msg").textContent = {
+        idle: "", starting: "Starting camera…",
+        running: f.multi ? "Scan each display. Tap × when done." : "Aim at the label on the left edge of the frame",
+        failed: msg || "",
+      }[st];
+    },
+  };
+  function flash() {
+    const c = document.querySelector(".scanner .cam");
+    if (c) { c.classList.remove("got"); void c.offsetWidth; c.classList.add("got"); }
+  }
+  addEventListener("visibilitychange", () => { if (document.hidden) scanner.stop(); });
+  addEventListener("pagehide", () => scanner.release());
+
+  /* ---------- pieces ---------- */
+  const typeBand = (t) => `
+    <span class="sign-band" data-type="${t.id}">
+      ${t.mark}<span class="sign-label">${esc(t.label)}</span>
+      ${t.was ? `<span class="sign-was">Was:<b>$—</b></span>` : ""}
+    </span>`;
+
+  /* the sign as the display shows it — drawn on the real 2560×1440 canvas by js/sign.js (landscape only) */
+  const signOpts = () => ({ orient: f.orient, type: f.type || "edlp", priceC: f.priceC, wasC: f.wasC, uom: f.uom,
+    size: sizeNeeded() ? f.size : "", desc: f.desc, plu: f.plu, img: f.img });
+  const eSign = () => `<div class="esign" data-o="${f.orient}" id="esign">${ECSign.render(signOpts())}</div>`;
+  // re-measure once web fonts are in, so text widths match what renders
+  ECSign.ready.then(() => { const el = $("esign"); if (el) el.innerHTML = ECSign.render(signOpts()); });
+
+  function eyebrow() {
+    const n = f.devices.length;
+    const tag = (d) => `<span class="id-tag mono">${esc(d.serial)}</span>`;
+    if (f.step === "location") {
+      const d = f.devices[f.locIdx];
+      return d ? `<div class="eyebrow-row">${tag(d)}${n > 1 ? `<span>Display ${f.locIdx + 1} of ${n}</span>` : ""}</div>` : "";
+    }
+    if (["type", "details", "preview"].includes(f.step)) {
+      if (n > 1) return `<div class="eyebrow-row"><span class="id-tag">${n} displays</span><span>Same sign</span></div>`;
+      const d = f.devices[0];
+      return d ? `<div class="eyebrow-row">${tag(d)}<span>${esc(loc(d))}</span></div>` : "";
+    }
+    if (f.step === "wake") {
+      const d = f.devices[f.wakeIdx];
+      return d ? `<div class="eyebrow-row">${tag(d)}<span>${esc(loc(d))}${n > 1 ? ` · ${f.wakeIdx + 1} of ${n}` : ""}</span></div>` : "";
+    }
+    return "";
+  }
+
+  /* scan slots: filled rows + one blank row to type into (multi always has a next blank) */
+  function slotsHtml() {
+    const rows = f.devices.map((d, i) => `
+      <div class="slot filled"><span class="slot-n">${i + 1}</span><span class="mono slot-id">${esc(d.serial)}</span>
+        <button class="icon-btn plain" data-rm="${i}" aria-label="Remove ${esc(d.serial)}">${I.x}</button></div>`).join("");
+    const blank = f.multi || f.devices.length === 0 ? `
+      <div class="slot blank"><span class="slot-n">${f.devices.length + 1}</span>
+        <div class="serial-field"><input class="input" id="serial" autocomplete="off" inputmode="numeric" pattern="[0-9]*" spellcheck="false" aria-label="Display ID" placeholder="Scan or type ID" /><span class="len" id="len">0/${SERIAL_LEN}</span></div></div>` : "";
+    return rows + blank;
+  }
+  function paintSlots() {
+    const box = $("slots");
+    if (!box) return;
+    const typing = document.activeElement && document.activeElement.id === "serial";
+    box.innerHTML = slotsHtml();
+    $("slots-label").textContent = f.multi ? `${f.devices.length} scanned` : "Display";
+    $("scan-reject").innerHTML = f.reject ? `<div class="result bad" role="alert"><strong class="mono">${esc(f.reject.serial)}</strong><p>${esc(f.reject.why)}</p></div>` : "";
+    bindSlots();
+    if (typing && $("serial")) $("serial").focus();
+    refreshNext();
+  }
+  function bindSlots() {
+    const serial = $("serial");
+    if (serial) {
+      serial.addEventListener("focus", () => scanner.stop()); // never keyboard over a live camera
+      serial.addEventListener("input", () => {
+        const v = norm(serial.value);
+        serial.value = v;
+        $("len").textContent = `${v.length}/${SERIAL_LEN}`;
+        if (v.length === SERIAL_LEN) addSerial(v); // quiet until complete
+      });
+    }
+    document.querySelectorAll("[data-rm]").forEach((b) => b.addEventListener("click", () => {
+      f.devices.splice(+b.dataset.rm, 1); f.reject = null; save(); paintSlots();
+    }));
+  }
+
+  /* ---------- a location already taken: another display here, or replacing one (two per location at most) ---------- */
+  function occupancy(i) {
+    const d = f.devices[i];
+    if (!d || !locOk(d)) return null;
+    const key = loc(d);
+    const replacedByOthers = f.devices.filter((x, j) => j !== i && x.locMode === "replace").map((x) => x.replaces);
+    const existing = EC.atLocation(key).filter((x) => !replacedByOthers.includes(x.serial));
+    const batch = f.devices.filter((x, j) => j !== i && locOk(x) && loc(x) === key);
+    return { key, existing, batch, used: existing.length + batch.length };
+  }
+  function conflictOk(i) {
+    const o = occupancy(i), d = f.devices[i];
+    if (!o || !o.used) return true;
+    if (d.locKey !== o.key) return false;
+    if (o.used >= EC.LOC_MAX) return d.locMode === "replace" && o.existing.some((x) => x.serial === d.replaces);
+    return d.locMode === "add" || (d.locMode === "replace" && o.existing.some((x) => x.serial === d.replaces));
+  }
+  function conflictHtml() {
+    const i = f.locIdx, d = f.devices[i], o = occupancy(i);
+    if (!o || !o.used) { if (d) { delete d.locMode; delete d.replaces; delete d.locKey; } return ""; }
+    if (d.locKey !== o.key) { delete d.locMode; delete d.replaces; d.locKey = o.key; }
+    if (o.used >= EC.LOC_MAX && !o.existing.length) {
+      return `<div class="result bad" role="alert"><strong class="mono">${esc(o.key)}</strong><p>${EC.numWord(EC.LOC_MAX).replace(/^./, (c) => c.toUpperCase())} displays from this install already go here. That’s the limit. Use a different location.</p></div>`;
+    }
+    const names = EC.andList([...o.existing.map((x) => x.serial), ...o.batch.map((x) => `${x.serial} (this install)`)]);
+    const opt = (attrs, on, text) => `<button class="opt" ${attrs} aria-pressed="${on}"><span class="radio-dot"></span><span>${text}</span></button>`;
+    const replaceOpts = o.existing.map((x) => opt(`data-replace="${x.serial}"`, d.locMode === "replace" && d.replaces === x.serial, `Replacing <b class="mono">${esc(x.serial)}</b>`)).join("");
+    if (o.used >= EC.LOC_MAX) return `<div class="loc-conflict"><p>${esc(o.key)} already has ${EC.numWord(EC.LOC_MAX)} displays. That’s the limit. Is this one replacing one of them?</p>${replaceOpts}</div>`;
+    return `<div class="loc-conflict"><p>${esc(o.key)} already has ${esc(names)}. Is this one…</p>
+      ${opt('data-locmode="add"', d.locMode === "add", "Another display here")}
+      ${replaceOpts}</div>`;
+  }
+  function paintConflict() {
+    const box = $("loc-conflict"); if (!box) return;
+    box.innerHTML = conflictHtml(); save();
+    box.querySelectorAll("[data-locmode]").forEach((b) => b.onclick = () => { const d = f.devices[f.locIdx]; d.locMode = "add"; delete d.replaces; paintConflict(); refreshNext(); });
+    box.querySelectorAll("[data-replace]").forEach((b) => b.onclick = () => { const d = f.devices[f.locIdx]; d.locMode = "replace"; d.replaces = b.dataset.replace; paintConflict(); refreshNext(); });
+    refreshNext();
+  }
+
+  /* where to find the location: endcap or produce drawing; the field being typed lights up its part */
+  const LOC_LINES = {
+    endcap: ["Read the blue strip on the end of the shelf, top to bottom.", "The white label says the same: big number is Section, Zone is over Aisle.", "The big aisle number on the sign is not the location."],
+    produce: ["Read the blue strip on the table’s corner post, top to bottom.", "The white label on the table edge says the same: big number is Section, Zone is over Aisle."],
+  };
+  function locateGuide() {
+    const k = f.locKind === "produce" ? "produce" : "endcap";
+    return `<section class="locate" id="locate" data-open="${f.locGuide}" data-focus="">
+      <div class="locate-head">
+        <button class="locate-toggle" id="loc-guide" aria-expanded="${f.locGuide}"><span class="caret">${I.next}</span>Where to find it</button>
+        <div class="seg" role="group" aria-label="Fixture">
+          ${["endcap", "produce"].map((x) => `<button data-lockind="${x}" aria-pressed="${k === x}">${x === "endcap" ? "Endcap" : "Produce"}</button>`).join("")}
+        </div>
+      </div>
+      <div class="locate-body">
+        <div class="locate-art">${ECArt.locate(k)}</div>
+        <ul class="lines">${LOC_LINES[k].map((l) => `<li>${esc(l)}</li>`).join("")}</ul>
+      </div>
+    </section>`;
+  }
+
+  function body() {
+    switch (f.step) {
+      case "battery": return `
+        <div class="safety-pin" role="note">${I.warn}<span>Li-ion pack. Keep metal off the plug tips. Swollen or hot pack: stop.</span></div>
+        ${EC.nz("offsite", carousel(INSERT, "Plug in the battery"))}`;
+
+      case "scan": return `
+                <button class="switch-row" id="multi" aria-pressed="${f.multi}">
+          <span>Same content on multiple displays</span><span class="switch" aria-hidden="true"><i></i></span>
+        </button>
+        <div id="scan-reject"></div>
+        <div class="slots">
+          <span class="section-label" id="slots-label" style="font-size:15px;margin:0"></span>
+          <div id="slots"></div>
+        </div>
+        ${ECArt.scanSpot()}`;
+
+      case "location": {
+        const d = f.devices[f.locIdx];
+        const n = f.devices.length;
+        return `
+          ${n > 1 ? `<div class="progress">${f.devices.map((_, i) => `<i class="${i < f.locIdx ? "done" : i === f.locIdx ? "now" : ""}"></i>`).join("")}</div>` : ""}
+          ${locateGuide()}
+          <div class="field"><label for="loc-zone">Zone <span class="hint">1–2 letters</span></label>
+            <input class="input big" id="loc-zone" data-loc="zone" value="${esc(d.zone)}" maxlength="2" autocomplete="off" autocapitalize="characters" spellcheck="false" inputmode="text" /></div>
+          <div class="field"><label for="loc-aisle">Aisle <span class="hint">up to 3 digits</span></label>
+            <input class="input big" id="loc-aisle" data-loc="aisle" value="${esc(d.aisle)}" maxlength="3" autocomplete="off" inputmode="numeric" pattern="[0-9]*" /></div>
+          <div class="field"><label for="loc-section">Section <span class="hint">up to 3 digits</span></label>
+            <input class="input big" id="loc-section" data-loc="section" value="${esc(d.section)}" maxlength="3" autocomplete="off" inputmode="numeric" pattern="[0-9]*" /></div>
+          <div class="loc-code"><span class="note">Location</span><b class="mono" id="loc-code">${esc(loc(d))}</b></div>
+          <div id="loc-conflict">${conflictHtml()}</div>`;
+      }
+
+      case "type": return `<div class="sign-list">${TYPES.map((t) => `
+        <button class="sign-card" data-type-pick="${t.id}" aria-pressed="${f.type === t.id}" ${f.type && f.type !== t.id ? 'data-dim="1"' : ""}>${typeBand(t)}</button>`).join("")}</div>`;
+
+      case "details": {
+        const t = typeOf();
+        return `
+          ${t ? `<div class="sign-chip">${typeBand(t)}</div>` : ""}
+          ${ECItem.html(f)}
+          ${(`<div class="field"><label for="d-price">Price</label>
+            <input class="input big money" id="d-price" data-money="priceC" value="${esc(fmtMoney(f.priceC))}" inputmode="numeric" pattern="[0-9]*" placeholder="$0.00" autocomplete="off" />
+            <span class="field-note" id="price-note">${ECItem.priceNote(f)}</span>
+            </div>`)}
+          ${t && t.was ? `<div class="field"><label for="d-was">Was price</label>
+            <input class="input big money" id="d-was" data-money="wasC" value="${esc(fmtMoney(f.wasC))}" inputmode="numeric" pattern="[0-9]*" placeholder="$0.00" autocomplete="off" />
+            <span class="field-note warn" id="was-note"></span></div>` : ""}`;
+      }
+
+      case "preview": {
+        const n = f.devices.length;
+        const key = previewKey();
+        return `
+          ${pv.ready(key) ? eSign() + (navigator.onLine ? "" : `<div class="offline-note" role="status"><span>Offline. Push Content needs a connection.</span></div>`) : pv.html(key, f.orient)}
+          <p class="note" style="margin:0">${n > 1 ? `Sending to ${n} displays.` : `Sending to ${esc(f.devices[0] ? f.devices[0].serial : "")}.`}</p>`;
+      }
+
+      case "wake": return `
+        ${ECArt.autoWake(`${carousel(WAKE.map((w) => Object.assign({}, w, { art: () => ECArt.wake(w.art) })), "Wake the display")}
+        <button class="hint-row" id="no-light">${I.warn}<span>No light? Check the battery</span>${I.next}</button>`)}`;
+
+      case "done": return `
+        <div class="done-list" id="done-list">${doneCards()}</div>
+        <p class="note">Each display updates in 3–5 minutes. Status changes to Updated when it connects. If nothing connects within ${EC.NOT_CONFIRMED_MIN} minutes it shows Not confirmed.</p>
+        <button class="btn" id="again">${via() ? "Replace or remove another" : "Install next display"}</button>
+        <button class="btn ghost" id="home">Home</button>`;
+    }
+    return "";
+  }
+
+  /* Sent: each display's live status (Waiting for wake → Updated, or Not confirmed), repainted every 5 s */
+  const chip = (st) => `<span class="status ${EC.STATUS[st].cls}">${st === "updated" ? I.ok : st === "waiting" ? I.clock : I.x}${EC.STATUS[st].word}</span>`;
+  function doneCards() {
+    const live = EC.fleet(s.id);
+    return f.devices.map((d) => {
+      const st = (live.find((x) => x.serial === d.serial) || {}).status || "waiting";
+      return `
+          <div class="device-card"><div class="head">
+            <span><span class="mono" style="font-weight:700">${esc(d.serial)}</span><br><span class="note">${esc(loc(d))}</span></span>
+            ${chip(st)}
+          </div>${d.locMode === "replace" && d.replaces ? `<p class="note" style="margin:8px 0 0">Replaced ${esc(d.replaces)}. Put it in the back room where the new displays are kept, battery still in. Someone will be by to collect it.</p>` : ""}</div>`;
+    }).join("");
+  }
+  let ticker = 0;
+
+  /* camera window: drawn at the very top of the screen, right under the phone's own camera */
+  const scanBlock = () => `<div class="scan-top">
+        <div class="scanner" id="scanner" data-state="idle">
+          <button class="viewfinder" id="vf" aria-label="Start camera and scan the bezel barcode">
+            <span class="vf-frame"></span>
+            <span class="vf-hint">${I.scan.replace("<svg", '<svg style="width:28px;height:28px"')}Tap to scan again</span>
+          </button>
+          <div class="cam">
+            <video id="scan-video" playsinline muted></video>
+            <span class="vf-frame"></span><span class="scanline"></span>
+            <button class="cam-btn" id="cam-cancel" aria-label="Stop camera">${I.x}</button>
+            <button class="cam-btn torch" id="torch" aria-label="Flashlight" aria-pressed="false" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M8 3h8l-2 6h-4z"/><path d="M10 9v11h4V9"/></svg></button>
+          </div>
+          <div class="cam-fail">
+            <strong>Camera unavailable</strong>
+            <span class="note">Type the ID in the list, or try again.</span>
+            <button class="btn ghost" id="cam-retry">Try again</button>
+          </div>
+          <div class="cam-state" aria-live="polite"><i></i><span id="cam-msg"></span></div>
+        </div>
+      </div>`;
+
+  /* ---------- render ---------- */
+  const app = $("app");
+  function render() {
+    scanner.release(); scanner.state = "idle";
+    clearInterval(ticker);
+    const i = steps().indexOf(f.step);
+    const total = steps().length - 1;
+    const [title, sub] = COPY[f.step];
+    const subText = f.step === "scan" && f.multi ? "Scan every display that gets the same sign." : sub;
+    app.innerHTML = `
+      <main class="screen" style="--tint:${via() ? "var(--tint-battery)" : "var(--tint-install)"}">
+        ${header({ home: true })}
+        <div class="flow">
+          ${f.step === "scan" ? scanBlock() : ""}
+          <div class="flow-top">
+            <div class="flow-name"><span class="kicker">${via() ? "Replace · New sign" : "Install"}</span><span class="count">${f.step === "done" ? "Done" : `${i + 1} / ${total}`}</span></div>
+            <div class="progress">${steps().slice(0, total).map((_, k) => `<i class="${k < i ? "done" : k === i ? "now" : ""}"></i>`).join("")}</div>
+          </div>
+          <div class="step" id="body">
+            ${eyebrow()}
+            <h2>${esc(title)}</h2>
+            ${subText ? `<p class="note" style="margin:0;font-size:15px">${esc(subText)}</p>` : ""}
+            ${body()}
+          </div>
+          ${f.step === "done" ? "" : `
+          <nav class="flow-nav">
+            <button class="btn ghost" id="back">${I.back.replace("<svg", '<svg style="width:18px;height:18px"')} Back</button>
+            <button class="btn" id="next" ${valid() ? "" : "disabled"}>${esc(nextLabel())}</button>
+          </nav>`}
+        </div>
+      </main>`;
+    bindHeader();
+    bind();
+  }
+  function refreshNext() { const b = $("next"); if (b) { b.disabled = !valid(); b.textContent = nextLabel(); } }
+
+  /* swipe carousel (battery + wake): the picture swipes, dots under it, caption follows — same pattern as Swap Battery */
+  function carousel(steps, label) {
+    return `
+        <div class="wake-post">
+          <div class="carousel" id="track" tabindex="0" aria-roledescription="carousel" aria-label="${esc(label)}">
+            ${steps.map((w, i) => `<div class="slide" aria-label="Step ${i + 1} of ${steps.length}">${w.art()}</div>`).join("")}
+          </div>
+          <div class="dots" role="tablist" aria-label="Steps">
+            ${steps.map((w, i) => `<button class="dot" role="tab" data-i="${i}" aria-label="Step ${i + 1}: ${esc(w.title)}"></button>`).join("")}
+          </div>
+          <section class="caption" id="caption" aria-live="polite"></section>
+        </div>`;
+  }
+  function bindWake() {
+    const track = $("track");
+    if (!track) return;
+    const STEPS_ = f.step === "battery" ? INSERT : WAKE;
+    const field = f.step === "battery" ? "battSlide" : "wakeSlide";
+    const WAKE_ = STEPS_;
+    const dots = [...document.querySelectorAll(".dot")];
+    let idx = Math.min(f[field] || 0, WAKE_.length - 1);
+    const paint = () => {
+      const w = WAKE_[idx];
+      dots.forEach((d, k) => d.setAttribute("aria-selected", String(k === idx)));
+      if (!track.isConnected) return; // left the step before this frame
+      $("caption").innerHTML = `<span class="step-no">Step ${idx + 1} of ${WAKE_.length}</span><h2>${esc(w.title)}</h2>
+        <ul class="lines">${w.lines.map((l) => `<li>${esc(l)}</li>`).join("")}</ul>
+        ${idx === 0 ? `<p class="swipe-hint">Swipe the picture for the next step</p>` : ""}`;
+      f[field] = idx; save();
+    };
+    const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const goTo = (k, smooth = true) => {
+      idx = Math.max(0, Math.min(WAKE_.length - 1, k));
+      track.scrollTo({ left: idx * track.clientWidth, behavior: smooth && !reduce ? "smooth" : "auto" });
+      paint();
+    };
+    let ticking = false;
+    track.addEventListener("scroll", () => {
+      if (ticking) return; ticking = true;
+      requestAnimationFrame(() => {
+        ticking = false;
+        const k = Math.round(track.scrollLeft / track.clientWidth);
+        if (k !== idx && k >= 0 && k < WAKE_.length) { idx = k; paint(); }
+      });
+    }, { passive: true });
+    let drag = null;
+    track.addEventListener("pointerdown", (e) => {
+      if (e.pointerType !== "mouse") return;
+      drag = { x: e.clientX, left: track.scrollLeft, from: idx }; track.classList.add("dragging"); track.setPointerCapture(e.pointerId);
+    });
+    track.addEventListener("pointermove", (e) => { if (drag) track.scrollLeft = drag.left - (e.clientX - drag.x); });
+    const end = (e) => {
+      if (!drag) return;
+      const dx = e.clientX - drag.x, from = drag.from; track.classList.remove("dragging"); drag = null;
+      goTo(Math.abs(dx) > track.clientWidth * 0.15 ? from + (dx < 0 ? 1 : -1) : from);
+    };
+    track.addEventListener("pointerup", end); track.addEventListener("pointercancel", end);
+    track.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowRight") { e.preventDefault(); goTo(idx + 1); }
+      if (e.key === "ArrowLeft") { e.preventDefault(); goTo(idx - 1); }
+    });
+    dots.forEach((d) => d.addEventListener("click", () => goTo(+d.dataset.i)));
+    paint();
+    requestAnimationFrame(() => goTo(idx, false));
+  }
+
+  function checkWas() {
+    const n = $("was-note");
+    if (!n) return;
+    const p = centsToNum(f.priceC), w = centsToNum(f.wasC);
+    n.textContent = p !== null && w !== null && w <= p ? "Was price is not higher than the price. Check both." : "";
+  }
+
+  function bind() {
+    $("back")?.addEventListener("click", back);
+    $("next")?.addEventListener("click", next);
+    $("guide")?.addEventListener("click", openBatteryGuide);
+    $("no-light")?.addEventListener("click", openBatteryGuide);
+
+    // scanner + slots
+    if ($("scanner")) { scanner.paint("idle"); paintSlots(); }
+    $("vf")?.addEventListener("click", () => scanner.start());
+    // the camera opens with the screen: no extra tap (single mode with a display already in: wait for a tap)
+    if (f.step === "scan" && (f.multi || !f.devices.length)) setTimeout(() => scanner.start(), 0);
+    $("cam-retry")?.addEventListener("click", () => scanner.start());
+    $("cam-cancel")?.addEventListener("click", () => scanner.stop());
+    $("multi")?.addEventListener("click", () => {
+      f.multi = !f.multi;
+      if (!f.multi) f.devices = f.devices.slice(0, 1);
+      f.reject = null; save(); render();
+    });
+
+    // location guide: fixture switch, show/hide, and the field being typed lights up its part of the drawing
+    function bindLocate() {
+      document.querySelectorAll("[data-lockind]").forEach((b) => b.onclick = () => {
+        f.locKind = b.dataset.lockind; f.locGuide = true; save();
+        const typed = $("locate").dataset.typed;
+        $("locate").outerHTML = locateGuide(); bindLocate();
+        if (typed) $("locate").dataset.typed = typed; // once a field was tapped, the lines stay hidden
+      });
+      const t = $("loc-guide");
+      if (t) t.onclick = () => { f.locGuide = !f.locGuide; save(); $("locate").dataset.open = f.locGuide; t.setAttribute("aria-expanded", f.locGuide); };
+    }
+    bindLocate();
+    if (f.step === "location") paintConflict();
+    document.querySelectorAll("[data-loc]").forEach((inp) => {
+      inp.addEventListener("focus", () => { const g = $("locate"); if (g) { g.dataset.focus = inp.dataset.loc; g.dataset.typed = "1"; } });
+      inp.addEventListener("blur", () => { const g = $("locate"); if (g) g.dataset.focus = ""; });
+    });
+
+    // location: Zone letters only (caps), Aisle/Section digits only
+    document.querySelectorAll("[data-loc]").forEach((inp) => inp.addEventListener("input", () => {
+      const k = inp.dataset.loc;
+      const v = k === "zone" ? normZone(inp.value) : normNum(inp.value);
+      if (inp.value !== v) inp.value = v;
+      f.devices[f.locIdx][k] = v; save();
+      $("loc-code").textContent = loc(f.devices[f.locIdx]);
+      paintConflict();
+      refreshNext();
+    }));
+
+    // price type
+    document.querySelectorAll("[data-type-pick]").forEach((b) => b.addEventListener("click", () => {
+      f.type = b.dataset.typePick; save(); render();
+    }));
+
+    // product (proposed: review note 1): scan or type the barcode / PLU; the approved list fills the item. Price is always typed (v0.9.5).
+    ECItem.bind(f, { onItem: () => { save(); checkWas(); refreshNext(); } });
+
+    // money: digits in, decimals assumed (597 → $5.97)
+    document.querySelectorAll("[data-money]").forEach((inp) => inp.addEventListener("input", () => {
+      const c = normCents(inp.value);
+      f[inp.dataset.money] = c;
+      if (inp.dataset.money === "priceC") ECItem.priceTyped(f);
+      inp.value = fmtMoney(c);
+      try { inp.setSelectionRange(inp.value.length, inp.value.length); } catch { /* not supported */ }
+      save(); checkWas(); refreshNext();
+    }));
+    checkWas();
+
+    if (f.step === "preview") { const key = previewKey(); pv.ensure(key); $("pv-retry")?.addEventListener("click", () => pv.retry(key)); }
+
+    bindWake();
+
+    if (f.step === "done") ticker = setInterval(() => { const box = $("done-list"); if (box) box.innerHTML = doneCards(); }, 5000);
+    $("again")?.addEventListener("click", () => {
+      if (via()) { delete state.flows.install; save(); go("replace"); return; }
+      const keep = { lastZone: f.lastZone, lastAisle: f.lastAisle, orient: f.orient, locKind: f.locKind, locGuide: f.locGuide };
+      f = state.flows.install = Object.assign(fresh(), keep, { step: "battery" }); // every display needs its battery plugged in
+      save(); render();
+    });
+    $("home")?.addEventListener("click", () => { delete state.flows.install; go("home"); });
+  }
+
+  EC.flowPage("install", { back, finished: () => f.step === "done", atStart: () => f.step === "battery" && !via() });
+  render();
+})();
